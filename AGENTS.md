@@ -10,6 +10,10 @@ This file provides guidance to CodeBuddy Code when working with code in this rep
 - 兜底模式用系统 PATH 里的 ffmpeg（`FFMPEG` 常量默认 `"ffmpeg"`，可用环境变量 `FFMPEG` 覆盖；当前是 brew 的 `/opt/homebrew/bin/ffmpeg` 9.0.2，自带 CA 证书，https 源可直接拉）。
 - 无测试框架、无 linter、无构建步骤。所有逻辑集中在一个文件里；`tests/` 下是免依赖的回归脚本（`python3 tests/…` 直接跑）。
 
+## 交流规则
+
+- 使用中文回复
+
 ## 常用命令
 
 ```bash
@@ -29,6 +33,7 @@ sleep 8 && curl -s http://127.0.0.1:8899/api/status   # 期望看到 "PLAYING"
 # 回归测试（无需真电视，起假 DLNA 服务端；改发现/控制端点逻辑后必跑）
 python3 tests/test_tv_discovery.py                   # 期望 "17 passed, 0 failed"
 TV_IP=192.168.1.10 python3 tests/test_tv_discovery.py  # 追加真电视联调 (18 passed)
+python3 tests/test_source_speed.py                    # 源速度排序 (11 passed)
 
 # 改完内嵌 JS 必做（坑18：全角标点会炸掉整页脚本，Python 编译器查不出来）
 python3 -c "import re;s=open('tv.py',encoding='utf-8').read();m=re.search(r'PAGE = \"\"\"(.*?)\"\"\"',s,re.S);open('/tmp/p.js','w').write(re.search(r'<script>(.*?)</script>',m.group(1),re.S).group(1))" && node --check /tmp/p.js
@@ -89,7 +94,8 @@ python3 -c "import re;s=open('tv.py',encoding='utf-8').read();m=re.search(r'PAGE
   - **B. HiSmart 38400 主力**：电视固件自带的 HiSmart renderer 端口固定，不像乐播漂移。`discover_tv_ctrl()` 优先级 = **HiSmart(38400) > SSDP > 乐播(4915x)**；SSDP 仍用于取友好设备名并作次选。
   - **代码保险**：`soap_probe()` 验活（端口通/能下 description.xml 都不算，必须收到 `CurrentTransportState` 应答）、`TV._maybe_rediscover()` 连续 3 次传输层失败自动热切换。**改发现逻辑时：任何"先试默认端口"的兜底都必须带验活与重发现。**
   - **判据**：`set=0`=连不上控制通道，`set=500`=电视拒绝播放——排查先分清这两类。`RelTime` 在两个 renderer 上恒为 `00:00:00`，**不能用来判断是否真在播**；要证真在播，就让电视拉一个你控制的探针 URL 并观察访问日志。
-- **排障顺序（坑 24 教训）**：所有频道同时失败 → 先查控制通道（`state` 是否 UNKNOWN），别查源，源不会整齐地全体阵亡；怀疑"某次提交改坏的"时先 `git diff <commit> -- tv.py | grep -E "^[+-].*(端口|find_tv|SSDP)"` 确认是否真碰到相关代码，再用**同一份代码在两台机器跑**（Mac 正常/服务器失败 = 环境问题，非代码）。
+- **坑 25 测活≠测速，"活着的源"也会卡（2026-10-13 全频道卡顿）**：晚高峰源站照样回 HTTP 200，但吞吐只剩码率的 1/3，下载追不上播放 → 电视全卡，而只按"活/死"排序的「刷新源」让慢源永远霸占第 0 位。现 `speed_check()` 对首个 ts 分片发 Range 拉头部 1MB，按 Content-Range 总长推算整片耗时，**余量=片时长÷整片下载耗时，<1 数学上必卡**；「刷新源」改为死源垫底、活源按余量降序（结果新增 `slow` 计数）。伴生修复：中转 `-hls_time 2` 被 x264 默认 GOP（≈10s）架空、实际产出 5~10s 大切片，加 `-force_key_frames expr:gte(t,n_forced*2)` 等参数后精确 2.000s。**验证源必须 `curl -L`（这批源大量 302/301，不跟重定向会把好源误判成死源）。**
+- **排障顺序（坑 24/25 教训）**：所有频道同时**失败** → 先查控制通道（`state` 是否 UNKNOWN），源不会整齐地全体阵亡；所有频道同时**卡顿** → 先算各源吞吐余量（对 ts 分片实测，<1 必卡），别急着怀疑刚改的代码——时间相关≠因果，先证伪；怀疑"某次提交改坏的"时先 `git diff <commit> -- tv.py | grep -E "^[+-].*(端口|find_tv|SSDP)"` 确认是否真碰到相关代码，再用**同一份代码在两台机器跑**（Mac 正常/服务器失败 = 环境问题，非代码）。
 
 ## 页面与部署
 

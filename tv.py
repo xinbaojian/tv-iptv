@@ -235,6 +235,67 @@ def alive_check(url, timeout=4, use_proxy=False):
     except Exception:
         return False
 
+def speed_check(url, timeout=6, use_proxy=False):
+    """源可用性 + 实测吞吐余量. 返回 margin = 片时长 / 整片下载耗时 (>1 才能不卡), 死源返回 None.
+    坑25: 只测"活不活"(HTTP 200) 会漏掉晚高峰最典型的故障 —— 源站照样回 200, 但吞吐只有
+    码率的 1/3, 下载追不上播放, 电视端必卡. 必须对 ts 分片实测 (坑10: m3u8 只有几百字节,
+    测不出带宽). 用 Range 只拉头部 1MB 即可由 Content-Range 推算整片耗时, 不必下完整片."""
+    def _fetch(u, tmo, rng=None):
+        """返回 (body, 整片总字节或 None). 走代理时用清洗过环境的 curl (坑17)"""
+        if use_proxy and PROXY:
+            cmd = ["curl", "-sfL", "--max-time", str(tmo), "-A", "lavf", "-x", PROXY]
+            if rng:
+                cmd += ["-r", rng.split("=")[1]]
+            cmd.append(u)
+            env = dict(os.environ)
+            env.pop("no_proxy", None)
+            env.pop("NO_PROXY", None)
+            r = subprocess.run(cmd, capture_output=True, timeout=tmo + 4, env=env)
+            return (r.stdout if r.returncode == 0 else None), None
+        headers = {"User-Agent": "lavf"}
+        if rng:
+            headers["Range"] = rng
+        req = urllib.request.Request(u, headers=headers)
+        with urllib.request.urlopen(req, timeout=tmo) as r:
+            data = r.read()
+            total = None
+            if rng:
+                m = re.search(r"/(\d+)\s*$", r.headers.get("Content-Range") or "")
+                if m:  # "bytes 0-1048575/11374188" 里的总长
+                    total = int(m.group(1))
+            return data, total
+
+    try:
+        body, _ = _fetch(url, timeout)
+    except Exception:
+        return None
+    if not body or b"#EXTINF" not in body[:16384]:
+        return None
+    base = url.rsplit("/", 1)[0]
+    dur, seg = None, None
+    for line in body[:16384].decode(errors="replace").splitlines():
+        s = line.strip()
+        if s.startswith("#EXTINF"):
+            m = re.search(r":\s*([0-9.]+)", s)
+            dur = float(m.group(1)) if m else None
+        elif s and not s.startswith("#"):
+            seg = s if s.startswith("http") else base + "/" + s
+            break
+    if not seg or not dur or dur <= 0:
+        return None
+    t0 = time.time()
+    try:
+        data, total = _fetch(seg, timeout + 4, rng="bytes=0-1048575")
+    except Exception:
+        return 0.0          # 活着但分片拉不动: 排在能拉动的活源之后, 死源之前
+    el = time.time() - t0
+    if not data or el <= 0:
+        return 0.0
+    if total and total > len(data):
+        # Range 命中: 整片耗时 = 总长/吞吐, 余量 = 时长/整片耗时
+        return dur * (len(data) / el) / total
+    return dur / el         # 服务端不理 Range (回全量) 或本就小于 1MB: 拉到的即整片
+
 # ================= 电视发现 (SSDP, 通用 DLNA——不限于海信/乐播) =================
 def find_tv(timeout=3):
     """SSDP 搜索设置 IP 上的 DLNA MediaRenderer, 返回 (AVTransport 控制 URL, 设备名).
@@ -566,6 +627,11 @@ class Relay:
                "-timeout", "8000000",  # http 输入 8s 超时, 防源假死静默挂住 (12:42 事件)
                "-i", relay_url,
                "-vf", "scale=-2:1080",
+               # 坑25伴生: 不强制关键帧时 x264 默认 GOP≈250 帧(约10s), -hls_time 2 被架空,
+               # 实际产出 5~10s 大切片 —— 电视要下完一整片才能播, 起播慢且抗抖动差.
+               # 强制每 2s 一个关键帧后切片精确 2.000s (已在服务器实测验证)
+               "-g", "50", "-keyint_min", "50", "-sc_threshold", "0",
+               "-force_key_frames", "expr:gte(t,n_forced*2)",
                "-c:v", "libx264", "-preset", "veryfast",
                "-b:v", "3500k", "-maxrate", "4500k", "-bufsize", "9000k",
                "-c:a", "aac", "-b:a", "128k", "-ac", "2",
@@ -732,9 +798,6 @@ class Refresher:
         threading.Thread(target=self._run, args=(skip,), daemon=True).start()
         return True
 
-    def _alive(self, url, use_proxy=False):
-        return alive_check(url, use_proxy=use_proxy)
-
     def _run(self, skip):
         try:
             marks = {}
@@ -742,27 +805,34 @@ class Refresher:
 
             def probe(item):
                 ci, si, url, use_proxy = item
-                marks[(ci, si)] = self._alive(url, use_proxy)
+                marks[(ci, si)] = speed_check(url, use_proxy=use_proxy)
                 with self.lock:
                     self.done += 1
 
             parallel_map([(ci, si, s["url"], s.get("proxy", False))
                           for ci, c in enumerate(CHANNELS) for si, s in enumerate(c["sources"])],
                          probe)
-            dead = reordered = skipped = 0
+            dead = slow = reordered = skipped = 0
             with CH_LOCK:  # 与"拉源"并发时保护 sources 重排
                 for ci, c in enumerate(CHANNELS):
                     srcs = c["sources"]
                     if ci == skip:  # 正在播的频道不动, 避免换掉当前源
                         skipped += 1
                         continue
-                    order = sorted(range(len(srcs)), key=lambda si: (0 if marks.get((ci, si)) else 1, si))
+                    # 坑25: 排序不能只按"活/死" —— 活着但吞吐喂不动码率的源照样让电视卡成幻灯片.
+                    # 死源垫底, 活源按实测吞吐余量降序, 余量相同保持原有相对顺序
+                    order = sorted(range(len(srcs)),
+                                   key=lambda si: (marks.get((ci, si)) is None,
+                                                   -(marks.get((ci, si)) or 0.0),
+                                                   si))
                     if order != list(range(len(srcs))):
                         reordered += 1
-                    dead += sum(1 for si in order if not marks.get((ci, si)))
+                    dead += sum(1 for si in order if marks.get((ci, si)) is None)
+                    slow += sum(1 for si in order
+                                if marks.get((ci, si)) is not None and marks[(ci, si)] < 1.0)
                     c["sources"][:] = [srcs[i] for i in order]
             with self.lock:
-                self.result = {"checked": len(marks), "dead": dead,
+                self.result = {"checked": len(marks), "dead": dead, "slow": slow,
                                "reordered": reordered, "skipped": skipped}
             save_channels_file()  # 源顺序调整持久化
         except Exception as e:
@@ -1106,7 +1176,7 @@ function upd(){fetch('/api/status').then(r=>r.json()).then(s=>{
   if(rf.result){
    if(rf.result.error){ md.textContent='刷新失败: '+rf.result.error; }
    else{
-    md.textContent=`刷新完成: 检测 ${rf.result.checked} 条源, 失效 ${rf.result.dead} 条已后移, 调整 ${rf.result.reordered} 个频道`+
+    md.textContent=`刷新完成: 检测 ${rf.result.checked} 条源, 失效 ${rf.result.dead} 条已后移, 慢源 ${rf.result.slow||0} 条已按带宽降序, 调整 ${rf.result.reordered} 个频道`+
       (rf.result.skipped?` (跳过正在播的 ${rf.result.skipped} 个)`:'');
     setTimeout(()=>{md.textContent='';},8000);
    }
