@@ -1,0 +1,9 @@
+# 本地数据 / 运行时产物 (含个人网络配置, 不入库)
+config.json
+channels.json
+remote_sources/
+hls_cache/
+*.log
+nohup.out
+__pycache__/
+.DS_Store
