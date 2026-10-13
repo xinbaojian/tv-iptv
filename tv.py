@@ -16,9 +16,12 @@
 
 import argparse
 import http.server
+import ipaddress
 import json
 import os
+import queue
 import re
+import signal
 import socket
 import socketserver
 import shutil
@@ -28,6 +31,7 @@ import threading
 import time
 import urllib.parse
 import urllib.request
+import xml.sax.saxutils
 
 # ================= 配置 =================
 # 默认值; 页面"设置"保存后写入 config.json, 重启不丢 (config.json 优先于这里的默认值)
@@ -67,7 +71,8 @@ def load_config():
         except Exception as e:
             print(f"[配置] config.json 解析失败, 使用默认值: {e}")
     for k in DEFAULTS:
-        v = str(cfg.get(k) or "").strip()
+        v = cfg.get(k)
+        v = str(v).strip() if isinstance(v, str) else ""  # 非字符串(如手写数字/对象)一律忽略
         if not v:
             continue
         if k == "TV_IP":
@@ -85,14 +90,21 @@ def load_config():
 def save_settings(d):
     """校验 + 应用 + 持久化, 返回错误信息或 None"""
     global TV_IP, MAC_IP, PROXY, FFMPEG
-    ip_re = re.compile(r"^\d{1,3}(\.\d{1,3}){3}$")
+
+    def valid_ip(s):
+        try:
+            ipaddress.IPv4Address(s)  # 只认 IPv4: MAC_IP 要拼进 http://IP:port, IPv6 得加方括号
+            return True
+        except Exception:
+            return False
+
     tv = str(d.get("tv_ip") or "").strip()
     mac = str(d.get("mac_ip") or "").strip()
     proxy = str(d.get("proxy") or "").strip()
     ff = str(d.get("ffmpeg") or "").strip()
-    if not ip_re.match(tv):
+    if not valid_ip(tv):
         return "电视 IP 格式不对"
-    if not ip_re.match(mac):
+    if not valid_ip(mac):
         return "本机 IP 格式不对"
     if proxy and not re.match(r"^https?://", proxy):
         return "代理地址需以 http:// 或 https:// 开头 (留空表示不用代理)"
@@ -104,6 +116,10 @@ def save_settings(d):
 # 频道表: 不再硬编码, 存于 channels.json (页面"刷新源/拉源"会更新并写回)
 CHANNELS = []
 CHANNELS_PATH = os.path.join(BASE, "channels.json")
+# 保护 CHANNELS 变异 + channels.json 写盘: "刷新源"与"拉源"可并行, 两个 json.dump
+# 各自 open(...,"w") 截断后交叉增量写会产出损坏 JSON (重启后频道全丢).
+# 用 RLock: 变异块内会再调 save_channels_file (同线程二次获取)
+CH_LOCK = threading.RLock()
 
 def load_channels():
     """启动时从 channels.json 读频道表; 文件损坏/缺失则频道列表为空"""
@@ -132,10 +148,14 @@ def load_channels():
     return False
 
 def save_channels_file():
-    """把内存中的频道表写回 channels.json (刷新源/拉源后调用)"""
+    """把内存中的频道表写回 channels.json (刷新源/拉源后调用).
+    原子写: 临时文件 + os.replace, 防崩溃/并发写出半截文件; 持 CH_LOCK 防交叉写"""
+    tmp = CHANNELS_PATH + ".tmp"
     try:
-        with open(CHANNELS_PATH, "w", encoding="utf-8") as f:
-            json.dump(CHANNELS, f, ensure_ascii=False, indent=1)
+        with CH_LOCK:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(CHANNELS, f, ensure_ascii=False, indent=1)
+            os.replace(tmp, CHANNELS_PATH)
         return None
     except Exception as e:
         print(f"[频道] 写入 channels.json 失败: {e}")
@@ -161,8 +181,52 @@ def url_key(u):
     except Exception:
         return u
 
-def alive_check(url, timeout=4):
-    """源地址可用性: HTTP 200 且返回有效 HLS 播放列表"""
+def parallel_map(items, fn, workers=6):
+    """固定 worker 池并行处理, 替代一任务一线程 (刷新源 255 条源会起 255 个线程,
+    拉源测活可达 400+; worker 数即并发上限, 替代原来的 Semaphore)"""
+    items = list(items)
+    if not items:
+        return
+    q = queue.Queue()
+    for it in items:
+        q.put(it)
+
+    def worker():
+        while True:
+            try:
+                it = q.get_nowait()
+            except queue.Empty:
+                return
+            try:
+                fn(it)
+            except Exception as e:
+                print(f"[并行] 任务异常: {e}")
+            finally:
+                q.task_done()
+
+    ts = [threading.Thread(target=worker, daemon=True)
+          for _ in range(min(workers, len(items)))]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join()
+
+def alive_check(url, timeout=4, use_proxy=False):
+    """源地址可用性: HTTP 200 且返回有效 HLS 播放列表.
+    use_proxy: 源标记 proxy=True 时显式走 PROXY. 注意进程里 http_proxy 已被 main()
+    清空且 no_proxy='*' —— urllib 默认处理器永远直连, 走代理必须像坑17 那样用
+    清洗过环境的 curl 子进程 + 显式 -x (urllib 的 ProxyHandler 也咨询 no_proxy)"""
+    if use_proxy and PROXY:
+        try:
+            env = dict(os.environ)
+            env.pop("no_proxy", None)
+            env.pop("NO_PROXY", None)
+            r = subprocess.run(["curl", "-sfL", "--max-time", str(timeout + 2),
+                                "-A", "lavf", "-x", PROXY, url],
+                               capture_output=True, timeout=timeout + 6, env=env)
+            return r.returncode == 0 and b"#EXTINF" in r.stdout[:8192]
+        except Exception:
+            return False
     try:
         req = urllib.request.Request(url, headers={"User-Agent": "lavf"})
         with urllib.request.urlopen(req, timeout=timeout) as r:
@@ -222,16 +286,168 @@ def find_tv(timeout=3):
         pass
     return None
 
-def guess_tv_ctrl():
-    """SSDP 失败时直接猜 49152 (乐播 DLNA 默认端口)"""
-    return f"http://{TV_IP}:49152/_urn:schemas-upnp-org:service:AVTransport_control", f"未知设备({TV_IP})"
+# ---- 控制端点校验与候选探测 ----
+# 坑24: 乐播 DLNA 端口不是固定的. 电视/投屏应用重启后会重选端口 (亲历 49152 → 49153),
+# 而 SSDP 一旦拿不到应答 (如宿主防火墙拦掉组播回包), 旧代码只能死猜 49152 ——
+# 猜错即所有 SOAP 连接被拒, 表现就是"所有频道都无法播放" (set=0 play=0, state=UNKNOWN).
+# 故: ①候选端口成片探测; ②任何拿到的地址一律用 SOAP 验活后才采用; ③运行中连续失败自动重发现.
+#
+# 优先级 (2026-10-13 调整): SSDP > HiSmart 38400 > 乐播 4915x.
+# 电视固件自带的 HiSmart renderer 端口固定 (38400), 不像乐播那样重启漂移, 因此作为
+# 乐播不可用时的首选兜底; 乐播端口列表仍保留 (HiSmart 万一被固件关掉时不至于全灭).
+# 实测两者能力等价: Set/Play/GetMediaInfo/GetTransportInfo 均 200, CurrentURI 比对一致,
+# 且都真的回拉了本机切片 (用 18999 探针服务验证电视确实发起 /probe.m3u8 + /seg1.ts)。
+HISMART_AVT_PATH = "/upnp/control/mingusavtr"
+HISMART_PORTS = (38400,)
+LEBO_AVT_PATH = "/_urn:schemas-upnp-org:service:AVTransport_control"
+LEBO_PORTS = (49152, 49153, 49154, 49150, 49155, 49156, 49157, 49158, 49159, 49160)
+
+def soap_envelope(action, args_xml):
+    """SOAP 1.1 信封. TV.soap_raw 与 soap_probe 共用一份, 免得两处信封漂移"""
+    return (f'<?xml version="1.0" encoding="utf-8"?>'
+            f'<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" '
+            f's:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">'
+            f'<s:Body><u:{action} xmlns:u="urn:schemas-upnp-org:service:AVTransport:1">'
+            f'{args_xml}</u:{action}></s:Body></s:Envelope>').encode()
+
+def soap_probe(url, timeout=2):
+    """端点是否真能用: 返回 200 且响应体确实是 GetTransportInfo 应答才算数.
+    比"端口通"或"description.xml 能下载"更可信——只有它能证明这里是可用的 AVTransport.
+    注意两个反向陷阱: ①500 不算成功 (端点活着但这个动作不认); ②端口通、回 200 但内容
+    不是 DLNA 应答 (例如同机别的 HTTP 服务恰好占了这个端口) 也不算成功"""
+    req = urllib.request.Request(
+        url, data=soap_envelope("GetTransportInfo", "<InstanceID>0</InstanceID>"),
+        headers={"Content-Type": 'text/xml; charset="utf-8"',
+                 "SOAPACTION": '"urn:schemas-upnp-org:service:AVTransport:1#GetTransportInfo"'})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            if r.status != 200:
+                return False
+            body = r.read(4096).decode(errors="replace")
+    except Exception:
+        return False
+    return "GetTransportInfoResponse" in body or "CurrentTransportState" in body
+
+def probe_ctrl_candidates(cands, timeout=2, workers=6):
+    """并行探测一层候选端点, 命中即短路返回. 并行是为了把最坏耗时压到单次超时的量级
+    (电视关机时逐个串行探测 10 个端口要 20s, 并行只要 2s)"""
+    cands = list(cands)
+    if not cands:
+        return None
+    hit, lock, q = [None], threading.Lock(), queue.Queue()
+    for c in cands:
+        q.put(c)
+
+    def worker():
+        while True:
+            with lock:
+                if hit[0]:
+                    return
+            try:
+                c = q.get_nowait()
+            except queue.Empty:
+                return
+            if soap_probe(c, timeout):
+                with lock:
+                    if not hit[0]:
+                        hit[0] = c
+                return
+
+    ts = [threading.Thread(target=worker, daemon=True)
+          for _ in range(min(workers, len(cands)))]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join()
+    return hit[0]
+
+def discover_tv_ctrl(timeout=3):
+    """返回 (控制URL, 设备名). 优先级: HiSmart(端口固定) > SSDP > 乐播(端口漂移).
+    任何来源的地址都必须验活才算数——"拿到了地址"≠"地址活着":
+    电视重启后 SSDP 缓存会过期, 半死端点也会一直不应答"""
+    found = find_tv(timeout)  # SSDP: 顺带拿到友好设备名 (失败返回 None, 不阻塞后续探测)
+    dev = found[1] if found else f"未知设备({TV_IP})"
+
+    # 1) HiSmart: 电视固件自带, 端口固定 38400, 不受乐播重启漂移影响 → 最稳, 优先
+    url = probe_ctrl_candidates([f"http://{TV_IP}:{p}{HISMART_AVT_PATH}" for p in HISMART_PORTS])
+    if url:
+        print(f"[电视] 端口探测命中 (HiSmart 固定端口): {url}")
+        return url, dev
+
+    # 2) SSDP 结果: 端口真实, 但要验活 (缓存/半死端点不可信)
+    if found:
+        if soap_probe(found[0]):
+            return found
+        print(f"[电视] SSDP 端点不应答, 转端口探测: {found[0]}")
+
+    # 3) 乐播端口列表: 端口会漂移, 只能枚举兜底
+    url = probe_ctrl_candidates([f"http://{TV_IP}:{p}{LEBO_AVT_PATH}" for p in LEBO_PORTS])
+    if url:
+        print(f"[电视] 端口探测命中 (乐播): {url}")
+        return url, dev
+
+    # 全都不通: 给个默认值, 至少日志里能看到试的是哪个 (播放会失败, 但状态可查)
+    return f"http://{TV_IP}:{LEBO_PORTS[0]}{LEBO_AVT_PATH}", dev
 
 # ================= DLNA 控制 =================
 class TV:
+    # 连续 N 次传输层失败即认为端点已死, 触发重新发现 (坑24)
+    REDISCOVER_AFTER = 3
+    REDISCOVER_COOLDOWN = 10.0
+    # 类级默认值: 记账代码在 __init__ 之前/之外被调用时也不炸 (坑7 老调 —— 兜底路径要最健壮)
+    fail_lock = None
+    fail_streak = 0
+    rediscovering = False
+    last_rediscover = 0.0
+
     def __init__(self):
-        url, name = find_tv() or guess_tv_ctrl()
+        # 坑5: 电视 SOAP 并发弱. status 轮询(每2.5s)与播放确认循环会同时打电视,
+        # 并发请求偶发被断连 → 直连误判失败 → 白白降级到中转. 所有 SOAP 用这把锁串行化.
+        self.soap_lock = threading.Lock()
+        self.fail_lock = threading.Lock()
+        self.fail_streak = 0        # 连续传输层失败次数 (HTTPError 不算: 端点活着)
+        self.rediscovering = False
+        self.last_rediscover = 0.0
+        url, name = discover_tv_ctrl()  # 坑24: SSDP 结果必须验活, 否则探测候选端口
         self.ctrl, self.name = url, name
         print(f"[电视] 控制: {self.ctrl} (设备: {self.name})")
+
+    def _fail_guard(self):
+        """惰性取记账锁: 即使对象没走 __init__ (测试桩/异常构造) 也不会炸.
+        坑7 老调 —— 兜底记账代码本身要最健壮"""
+        lock = getattr(self, "fail_lock", None)
+        if lock is None:
+            lock = self.fail_lock = threading.Lock()
+        return lock
+
+    def _note_ok(self):
+        with self._fail_guard():
+            self.fail_streak = 0
+
+    def _maybe_rediscover(self):
+        """传输层连续失败 → 电视可能换端口/重启了, 重新发现一次.
+        只调模块级 soap_probe (不碰 soap_lock / soap_raw), 否则持锁重入必自死锁 (坑16)"""
+        with self._fail_guard():
+            self.fail_streak = getattr(self, "fail_streak", 0) + 1
+            now = time.time()
+            if (self.fail_streak < self.REDISCOVER_AFTER or self.rediscovering
+                    or now - getattr(self, "last_rediscover", 0.0) < self.REDISCOVER_COOLDOWN):
+                return
+            self.rediscovering = True
+            self.last_rediscover = now
+        try:
+            print(f"[电视] 连续 {self.fail_streak} 次 SOAP 失败, 重新发现控制端点…")
+            url, name = discover_tv_ctrl()
+            if url and url != self.ctrl and soap_probe(url):
+                self.ctrl, self.name = url, name
+                print(f"[电视] 控制端点已更新: {self.ctrl} (设备: {self.name})")
+                with self._fail_guard():
+                    self.fail_streak = 0
+        except Exception as e:
+            print(f"[电视] 重新发现失败: {e}")
+        finally:
+            with self.fail_lock:
+                self.rediscovering = False
 
     def soap(self, action, args_xml):
         # 坑12修复: 失败必须返回 int (原返回错误字符串, 调用方 r_set==200 比较永远 False,
@@ -240,7 +456,7 @@ class TV:
 
     def state(self):
         for attempt in range(3):
-            code, body = self.soap_raw("GetTransportInfo", "<InstanceID>0</InstanceID>")
+            code, body = self.soap_raw("GetTransportInfo", "<InstanceID>0</InstanceID>", timeout=4)
             if code == 200:
                 m = re.search(r"CurrentTransportState>([^<]+)", body)
                 if m:
@@ -248,45 +464,50 @@ class TV:
             time.sleep(1)
         return "UNKNOWN"
 
-    def soap_raw(self, action, args_xml):
-        body = (f'<?xml version="1.0" encoding="utf-8"?>'
-                f'<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" '
-                f's:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">'
-                f'<s:Body><u:{action} xmlns:u="urn:schemas-upnp-org:service:AVTransport:1">'
-                f'{args_xml}</u:{action}></s:Body></s:Envelope>').encode()
-        req = urllib.request.Request(self.ctrl, data=body, headers={
+    def soap_raw(self, action, args_xml, timeout=8):
+        req = urllib.request.Request(self.ctrl, data=soap_envelope(action, args_xml), headers={
             "Content-Type": 'text/xml; charset="utf-8"',
             "SOAPACTION": f'"urn:schemas-upnp-org:service:AVTransport:1#{action}"'})
         try:
-            r = urllib.request.urlopen(req, timeout=8)
-            return r.status, r.read().decode(errors="replace")
+            with self.soap_lock:
+                r = urllib.request.urlopen(req, timeout=timeout)
+                body = r.read().decode(errors="replace")
+            self._note_ok()   # 拿锁外记账, 避免与重发现路径交叉持锁
+            return r.status, body
         except urllib.error.HTTPError as e:
+            # 端点活着 (应答了, 只是这个动作不认) —— 不算端点故障, 不触发重发现
+            self._note_ok()
             return e.code, e.read().decode(errors="replace")[:200]
         except Exception as e:
+            self._maybe_rediscover()  # 连不上: 端点可能已失效 (坑24)
             return 0, str(e)
 
     def current_uri(self):
         """电视实际持有的 URI (GetMediaInfo). 状态 PLAYING 不代表播的是新 URL, 必须核对它"""
         for attempt in range(3):
-            code, body = self.soap_raw("GetMediaInfo", "<InstanceID>0</InstanceID>")
+            code, body = self.soap_raw("GetMediaInfo", "<InstanceID>0</InstanceID>", timeout=4)
             if code == 200:
-                m = re.search(r"<CurrentURI>(.*?)</CurrentURI>", body)
+                m = re.search(r"<CurrentURI>(.*?)</CurrentURI>", body, re.S)
                 if m:
-                    return m.group(1)
+                    # 返回的是 XML 原文, & 会被编码成 &amp; — 反转义后才能和下发 URL 比对
+                    return xml.sax.saxutils.unescape(m.group(1))
             time.sleep(1)
         return None
 
     def play_url(self, url):
-        """设置 URI 并播放. 乐播对带 query 参数的 URL 返回 500 (坑12),
-        剥掉 query 重试一次; 返回 (set状态码, play状态码, 实际下发的URL)"""
+        """设置 URI 并播放.
+        URL 必须 XML 转义后再进 SOAP 体: 直播源 query 里大量 &token=... (115/255 条),
+        裸 & 不是合法 XML 实体, 电视解析器直接 500 —— 这才是坑12"带 query 必拒"的真根因,
+        转义后大部分源不必再剥 query. 乐播仍有缺陷时保留剥 query 重试兜底.
+        返回 (set状态码, play状态码, 实际下发的URL)"""
         r_set = self.soap("SetAVTransportURI",
-                          f"<InstanceID>0</InstanceID><CurrentURI>{url}</CurrentURI>"
+                          f"<InstanceID>0</InstanceID><CurrentURI>{xml.sax.saxutils.escape(url)}</CurrentURI>"
                           f"<CurrentURIMetaData>&lt;DIDL-Lite&gt;&lt;/DIDL-Lite&gt;</CurrentURIMetaData>")
         final_url = url
         if r_set != 200 and "?" in url:
             stripped = url.split("?", 1)[0]
             r2 = self.soap("SetAVTransportURI",
-                           f"<InstanceID>0</InstanceID><CurrentURI>{stripped}</CurrentURI>"
+                           f"<InstanceID>0</InstanceID><CurrentURI>{xml.sax.saxutils.escape(stripped)}</CurrentURI>"
                            f"<CurrentURIMetaData>&lt;DIDL-Lite&gt;&lt;/DIDL-Lite&gt;</CurrentURIMetaData>")
             if r2 == 200:
                 r_set, final_url = r2, stripped
@@ -313,6 +534,20 @@ class Relay:
     def start(self, idx, relay_url, use_proxy=False):
         """启动频道中转, 等首个切片就绪, 返回本机 HLS 地址"""
         chdir = os.path.join(HLS_ROOT, f"ch{idx}")
+        # 换台即清掉其他频道的残留: chN/ 切片与 ff_N.log 只增不减 (49 个频道轮着中转能堆几百 MB);
+        # 旧 ffmpeg 已被 stop() 杀死, 留着旧切片电视也只会 404
+        try:
+            for d in os.listdir(HLS_ROOT):
+                if d.startswith("ch") and d[2:].isdigit() and int(d[2:]) != idx:
+                    shutil.rmtree(os.path.join(HLS_ROOT, d), ignore_errors=True)
+            for f in os.listdir(HLS_ROOT):
+                if f.startswith("ff_") and f.endswith(".log") and f != f"ff_{idx}.log":
+                    try:
+                        os.unlink(os.path.join(HLS_ROOT, f))
+                    except FileNotFoundError:
+                        pass
+        except Exception:
+            pass
         os.makedirs(chdir, exist_ok= True)
         for old in os.listdir(chdir):
             try:
@@ -322,6 +557,10 @@ class Relay:
         env = dict(os.environ)
         if use_proxy and PROXY:
             env["http_proxy"] = env["https_proxy"] = PROXY
+            # 坑17 同款: 进程级 no_proxy='*' 会让 ffmpeg 连显式 http_proxy 都绕过
+            # (libavformat/http.c 有 no_proxy 匹配, * 匹配所有主机) → 海外源静默直连失败
+            env.pop("no_proxy", None)
+            env.pop("NO_PROXY", None)
         errlog = open(os.path.join(HLS_ROOT, f"ff_{idx}.log"), "wb")
         cmd = [FFMPEG, "-y", "-hide_banner", "-loglevel", "error",
                "-timeout", "8000000",  # http 输入 8s 超时, 防源假死静默挂住 (12:42 事件)
@@ -339,8 +578,13 @@ class Relay:
         # 坑16: stop() 会抢同一把 self.lock (Lock 不可重入), 持锁调用必自死锁
         # (12:42 事件真凶: 兜底线程冻死, Player.lock 被占, 后续换台全部排队)
         self.stop()
-        with self.lock:
-            self.proc = subprocess.Popen(cmd, stderr=errlog, env=env)
+        try:
+            with self.lock:
+                # 子进程在 fork/exec 时已继承 fd 副本, 父进程这份必须关 —
+                # 否则每次中转泄漏一个句柄 (长跑 + 频繁兜底会耗尽 fd)
+                self.proc = subprocess.Popen(cmd, stderr=errlog, env=env)
+        finally:
+            errlog.close()
         # 等首个切片 (最多 15s)
         deadline = time.time() + 15
         while time.time() < deadline:
@@ -362,7 +606,9 @@ class Player:
         self.puller = SourcePuller()
         self.current = -1     # 当前频道索引
         self.cur_src = 0      # 当前源索引
-        self.mode = None      # direct / relay
+        self.mode = None      # direct / relay / starting / error
+        self.gen = 0          # 换台世代号: 每次 play +1, 旧线程发现 gen 过期即作废
+        self.gen_lock = threading.Lock()
         self.lock = threading.Lock()
 
     def play(self, idx, src_idx=None):
@@ -372,14 +618,19 @@ class Player:
         if src_idx is None:
             src_idx = self.cur_src if idx == self.current else 0
         src_idx = max(0, min(src_idx, len(sources) - 1))
-        url = sources[src_idx]["url"]
-        use_proxy = sources[src_idx].get("proxy", False)
         ret = {"ok": True, "mode": "starting", "name": name, "src": src_idx}
-        t = threading.Thread(target=self._play_sync, args=(idx, src_idx, url, use_proxy), daemon=True)
-        t.start()
+        with self.gen_lock:
+            self.gen += 1
+            gen = self.gen
+        # 乐观状态必须先于 t.start() 写: 若放在 start() 之后, GIL 可能在 start() 处
+        # 切换到播放线程, 它瞬间跑完(电视拒连快/ffmpeg秒退)后主线程才恢复, 会用
+        # "starting" 覆盖掉线程写好的最终态 (direct/relay/error) —— 真竞态, 已复现
         self.current = idx
         self.cur_src = src_idx
         self.mode = "starting"
+        t = threading.Thread(target=self._play_sync,
+                             args=(idx, src_idx, gen), daemon=True)
+        t.start()
         return ret
 
     def _try_direct(self, url):
@@ -389,6 +640,7 @@ class Player:
         if r_set != 200 or r_play != 200:
             print(f"  [直连] Set/Play 失败 set={r_set} play={r_play} url={url[:80]}")
             return False
+        st = uri = None  # 坑7: 先赋值, 异常路径也拿得到值 (失败日志不再重复打 state/uri)
         for _ in range(4):  # 最多等 8 秒
             time.sleep(2)
             st = self.tv.state()
@@ -397,35 +649,50 @@ class Player:
             uri = self.tv.current_uri()
             if st == "PLAYING" and uri is not None and uri.rstrip("/") == final_url.rstrip("/"):
                 return True
-        print(f"  [直连] 未确认 state={self.tv.state()} uri={self.tv.current_uri()} want={final_url[:80]}")
+        print(f"  [直连] 未确认 state={st} uri={uri} want={final_url[:80]}")
         return False
 
-    def _play_sync(self, idx, src_idx, url, use_proxy):
+    def _play_sync(self, idx, src_idx, gen):
         with self.lock:
             name = CHANNELS[idx]["name"]
             sources = CHANNELS[idx]["sources"]
             # ---- 直连优先: 用户选的源先试, 再按优先级轮询其余源 ----
             order = [src_idx] + [k for k in range(len(sources)) if k != src_idx]
             for k in order:
+                if gen != self.gen:  # 连点多台只播最后一个: 旧请求及时作废, 不白跑 6×10s
+                    print("[换台] 已被更新的请求取代, 放弃")
+                    return
                 print(f"[直连尝试] {name} 源{k}")
                 if self._try_direct(sources[k]["url"]):
+                    if gen != self.gen:
+                        return
                     self.current = idx
                     self.cur_src = k
                     self.mode = "direct"
                     print(f"[直连] {name} 源{k}")
                     return
             print(f"[直连全失败→中转] {name} 源{src_idx}")
-            # ---- 兜底: 中转 (用用户指定的源转码, 本机 HLS 地址无 query, 电视必收) ----
-            try:
-                self.relay.stop()
-                hls_url = self.relay.start(idx, url, use_proxy)
-                ok = self._try_direct(hls_url)
-                self.current = idx
-                self.cur_src = src_idx
-                self.mode = "relay"
-                print(f"[中转] {name} 源{src_idx} 确认={ok}")
-            except Exception as e:
-                print(f"[中转失败] {name}: {e}")
+            # ---- 兜底: 中转 (用户选的源优先, 失败再按优先级转其它源; 本机 HLS 地址无 query, 电视必收) ----
+            for k in order:
+                if gen != self.gen:
+                    return
+                try:
+                    self.relay.stop()
+                    hls_url = self.relay.start(idx, sources[k]["url"], sources[k].get("proxy", False))
+                    ok = self._try_direct(hls_url)
+                    if gen != self.gen:
+                        return
+                    self.current = idx
+                    self.cur_src = k
+                    self.mode = "relay"
+                    print(f"[中转] {name} 源{k} 确认={ok}")
+                    return
+                except Exception as e:
+                    print(f"[中转失败] {name} 源{k}: {e}")
+            if gen == self.gen:
+                # 全部源直连+中转都失败: 置 error 态, 否则 mode 永远停在 "starting"
+                self.mode = "error"
+                print(f"[中转全失败] {name}: 所有源直连和中转都失败")
 
     def stop(self):
         with self.lock:
@@ -465,36 +732,35 @@ class Refresher:
         threading.Thread(target=self._run, args=(skip,), daemon=True).start()
         return True
 
-    def _alive(self, url):
-        return alive_check(url)
+    def _alive(self, url, use_proxy=False):
+        return alive_check(url, use_proxy=use_proxy)
 
     def _run(self, skip):
         try:
-            sem = threading.Semaphore(4)
             marks = {}
             self.total = sum(len(c["sources"]) for c in CHANNELS)
-            def probe(ci, si, url):
-                with sem:
-                    marks[(ci, si)] = self._alive(url)
-                    with self.lock:
-                        self.done += 1
-            ts = [threading.Thread(target=probe, args=(ci, si, s["url"]), daemon=True)
-                  for ci, c in enumerate(CHANNELS) for si, s in enumerate(c["sources"])]
-            for t in ts:
-                t.start()
-            for t in ts:
-                t.join()
+
+            def probe(item):
+                ci, si, url, use_proxy = item
+                marks[(ci, si)] = self._alive(url, use_proxy)
+                with self.lock:
+                    self.done += 1
+
+            parallel_map([(ci, si, s["url"], s.get("proxy", False))
+                          for ci, c in enumerate(CHANNELS) for si, s in enumerate(c["sources"])],
+                         probe)
             dead = reordered = skipped = 0
-            for ci, c in enumerate(CHANNELS):
-                srcs = c["sources"]
-                if ci == skip:  # 正在播的频道不动, 避免换掉当前源
-                    skipped += 1
-                    continue
-                order = sorted(range(len(srcs)), key=lambda si: (0 if marks.get((ci, si)) else 1, si))
-                if order != list(range(len(srcs))):
-                    reordered += 1
-                dead += sum(1 for si in order if not marks.get((ci, si)))
-                c["sources"][:] = [srcs[i] for i in order]
+            with CH_LOCK:  # 与"拉源"并发时保护 sources 重排
+                for ci, c in enumerate(CHANNELS):
+                    srcs = c["sources"]
+                    if ci == skip:  # 正在播的频道不动, 避免换掉当前源
+                        skipped += 1
+                        continue
+                    order = sorted(range(len(srcs)), key=lambda si: (0 if marks.get((ci, si)) else 1, si))
+                    if order != list(range(len(srcs))):
+                        reordered += 1
+                    dead += sum(1 for si in order if not marks.get((ci, si)))
+                    c["sources"][:] = [srcs[i] for i in order]
             with self.lock:
                 self.result = {"checked": len(marks), "dead": dead,
                                "reordered": reordered, "skipped": skipped}
@@ -630,48 +896,46 @@ class SourcePuller:
             except Exception:
                 pass
             # ---- 按频道名匹配, 候选测活后追加 (每频道最多 8 条源, 跳过正在播频道) ----
-            index = {name_key(c["name"]): c for c in CHANNELS}
-            by_key = {}
-            for e in self.entries:
-                by_key.setdefault(name_key(e["name"]), []).append(e)
-            todo = []
-            for k, cands in by_key.items():
-                c = index.get(k)
-                if not c:
-                    continue
-                have = {url_key(s["url"]) for s in c["sources"]}
-                room = max(0, 8 - len(c["sources"]))
-                for e in cands:
-                    if room <= 0:
-                        break
-                    if url_key(e["url"]) not in have:
-                        todo.append((k, e))
-                        room -= 1
+            with CH_LOCK:
+                index = {name_key(c["name"]): c for c in CHANNELS}
+                by_key = {}
+                for e in self.entries:
+                    by_key.setdefault(name_key(e["name"]), []).append(e)
+                todo = []
+                for k, cands in by_key.items():
+                    c = index.get(k)
+                    if not c:
+                        continue
+                    have = {url_key(s["url"]) for s in c["sources"]}
+                    room = max(0, 8 - len(c["sources"]))
+                    for e in cands:
+                        if room <= 0:
+                            break
+                        if url_key(e["url"]) not in have:
+                            todo.append((k, e))
+                            room -= 1
             with self.lock:
                 self.stage = "测活合并"
                 self.total = len(todo)
                 self.done = 0
-            sem = threading.Semaphore(4)
             marks = {}
-            def probe(k, e):
-                with sem:
-                    marks[(k, url_key(e["url"]))] = alive_check(e["url"])
-                    with self.lock:
-                        self.done += 1
-            ts = [threading.Thread(target=probe, args=(k, e), daemon=True) for k, e in todo]
-            for t in ts:
-                t.start()
-            for t in ts:
-                t.join()
+
+            def probe(item):
+                k, e = item
+                marks[(k, url_key(e["url"]))] = alive_check(e["url"])
+                with self.lock:
+                    self.done += 1
+            parallel_map(todo, probe)
             added = {}
-            for k, e in todo:
-                if not marks.get((k, url_key(e["url"]))):
-                    continue
-                c = index[k]
-                if len(c["sources"]) >= 8 or url_key(e["url"]) in {url_key(s["url"]) for s in c["sources"]}:
-                    continue
-                c["sources"].append({"url": e["url"], "proxy": False})
-                added[c["name"]] = added.get(c["name"], 0) + 1
+            with CH_LOCK:  # 与"刷新源"并发时保护 append 与去重检查
+                for k, e in todo:
+                    if not marks.get((k, url_key(e["url"]))):
+                        continue
+                    c = index[k]
+                    if len(c["sources"]) >= 8 or url_key(e["url"]) in {url_key(s["url"]) for s in c["sources"]}:
+                        continue
+                    c["sources"].append({"url": e["url"], "proxy": False})
+                    added[c["name"]] = added.get(c["name"], 0) + 1
             err = save_channels_file()
             with self.lock:
                 self.result = {"files": files, "total": len(self.entries),
@@ -716,21 +980,21 @@ class SourcePuller:
         if any(name_key(c["name"]) == k for c in CHANNELS):
             return 0, "频道已存在"
         marks = {}
-        sem = threading.Semaphore(4)
+
         def probe(e):
-            with sem:
-                marks[e["url"]] = alive_check(e["url"])
-        ts = [threading.Thread(target=probe, args=(e,), daemon=True) for e in cands]
-        for t in ts:
-            t.start()
-        for t in ts:
-            t.join()
+            marks[e["url"]] = alive_check(e["url"])
+        parallel_map(cands, probe)
         alive = [e for e in cands if marks.get(e["url"])]
         if not alive:
             return 0, "候选源测活全部失败"
-        CHANNELS.append({"name": name, "sources": [{"url": e["url"], "proxy": False} for e in alive]})
-        save_channels_file()
-        return len(alive), None
+        err = None
+        with CH_LOCK:
+            # 测活要好几秒, 期间可能被并发刷新/添加改动, 落库前再查一次
+            if any(name_key(c["name"]) == k for c in CHANNELS):
+                return 0, "频道已存在"
+            CHANNELS.append({"name": name, "sources": [{"url": e["url"], "proxy": False} for e in alive]})
+            err = save_channels_file()
+        return len(alive), err
 
 # ================= 网页遥控器 =================
 PAGE = """<!doctype html><html><head><meta charset="utf-8">
@@ -806,9 +1070,11 @@ button.srcon{background:#1f6f3f;border-color:#2f9f5f}
 <div class="mode" id="mode"></div>
 <script>
 let CH=[], refreshing=false, pulling=false;
+// 外部数据(远端源仓库的频道名)进 innerHTML 前必须转义, 否则名字里带 <img onerror=...> 即 XSS
+function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
 function renderCH(){
  document.getElementById('chs').innerHTML=CH.map((c,i)=>
-   `<button id="b${i}" onclick="go('/api/play/${i}')">${c.name}</button>`).join('');
+   `<button id="b${i}" onclick="go('/api/play/${i}')">${esc(c.name)}</button>`).join('');
 }
 function reloadCH(){
  fetch('/api/channels').then(r=>r.json()).then(d=>{CH=d;renderCH();upd();}).catch(()=>{});
@@ -818,7 +1084,7 @@ fetch('/api/channels').then(r=>r.json()).then(d=>{
 });
 function upd(){fetch('/api/status').then(r=>r.json()).then(s=>{
  const now=document.getElementById('now'), srcs=document.getElementById('srcs');
- now.textContent = s.ch>=0 ? `▶ ${s.name} [${s.mode==='relay'?'中转':s.mode==='direct'?'直连':(s.mode||'')}] ${s.state}` : '已停止';
+ now.textContent = s.ch>=0 ? `▶ ${s.name} [${s.mode==='relay'?'中转':s.mode==='direct'?'直连':s.mode==='error'?'失败':(s.mode||'')}] ${s.state}` : '已停止';
  CH.forEach((c,i)=>{const b=document.getElementById('b'+i); if(b) b.className=(i===s.ch?'on':'');});
  if(s.ch>=0 && s.nsrc>1){
   srcs.innerHTML = '<span class="srclbl">线路:</span>' + Array.from({length:s.nsrc},(_,k)=>
@@ -892,11 +1158,11 @@ function querySources(){
   }
   box.innerHTML = `<div style="color:#888;margin-bottom:4px">匹配 ${d.total} 条 / ${d.groups.length} 个频道名 (缓存 ${d.fetched_at})</div>` +
    d.groups.map(g=>{
-    const esc=g.name.replace(/'/g,"");
-    const hosts=g.hosts.slice(0,2).join('，');
-    return `<div style="margin:3px 0">● ${g.name} <span style="color:#888">(${g.count}条 | ${hosts})</span> `+
+    const nm=encodeURIComponent(g.name).replace(/'/g,"%27");
+    const hosts=g.hosts.slice(0,2).map(esc).join('，');
+    return `<div style="margin:3px 0">● ${esc(g.name)} <span style="color:#888">(${g.count}条 | ${hosts})</span> `+
       (g.exists? '<span style="color:#7ee787">✓已有</span>'
-               : `<button style="width:auto;min-height:0;padding:4px 10px;font-size:12px;background:#1f6f3f;text-align:center" onclick="addChannel('${esc}')">测活添加</button>`)+
+               : `<button style="width:auto;min-height:0;padding:4px 10px;font-size:12px;background:#1f6f3f;text-align:center" onclick="addChannel(decodeURIComponent('${nm}'))">测活添加</button>`)+
       `</div>`;
    }).join('');
  }).catch(()=>{ box.textContent='查询失败'; });
@@ -951,6 +1217,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         pass
 
     def reply(self, code, body, ctype="application/json"):
+        self._responded = True
         data = body if isinstance(body, bytes) else body.encode()
         self.send_response(code)
         self.send_header("Content-Type", ctype)
@@ -960,6 +1227,20 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def do_GET(self):
+        # 统一兜底: handler 抛异常时连接被直接断掉, 前端 .catch(()=>{}) 静默无感
+        try:
+            self._do_GET()
+        except (BrokenPipeError, ConnectionResetError):
+            pass  # 客户端主动断开 (页面刷新/快速切台), 正常现象
+        except Exception as e:
+            print(f"[HTTP] {self.path} 处理异常: {e}")
+            if not getattr(self, "_responded", False):  # 已开始发送响应就不能再补 500
+                try:
+                    self.reply(500, json.dumps({"ok": False, "error": str(e)[:200]}, ensure_ascii=False))
+                except Exception:
+                    pass
+
+    def _do_GET(self):
         path = urllib.parse.urlparse(self.path).path
         # HLS 切片服务 (兜底模式)
         m = re.match(r"^/hls/ch(\d+)/(live\.m3u8|seg\d+\.ts)$", path)
@@ -970,6 +1251,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             data = open(fname, "rb").read()
             ctype = "application/vnd.apple.mpegurl" if fname.endswith(".m3u8") else "video/mp2t"
             self.send_response(200)
+            self._responded = True
             self.send_header("Content-Type", ctype)
             self.send_header("Cache-Control", "no-cache")
             self.send_header("Access-Control-Allow-Origin", "*")
@@ -986,10 +1268,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
         m = re.match(r"^/api/play/(\d+)$", path)
         if m:
             idx = int(m.group(1))
+            if not CHANNELS:
+                return self.reply(404, '{"error":"频道列表为空, 请先用页面拉源或编辑 channels.json"}')
             if idx >= len(CHANNELS):
                 return self.reply(404, '{"error":"no such channel"}')
             qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
-            src_idx = int(qs["src"][0]) if "src" in qs else None
+            try:
+                src_idx = int(qs["src"][0]) if "src" in qs else None
+            except (KeyError, IndexError, ValueError):
+                src_idx = None  # src=abc 之类的脏参数当作默认源, 不炸 500
             try:
                 return self.reply(200, json.dumps(self.player.play(idx, src_idx), ensure_ascii=False))
             except Exception as e:
@@ -1058,7 +1345,13 @@ def main():
     for v in ("http_proxy", "https_proxy", "all_proxy", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"):
         os.environ.pop(v, None)
     os.environ["no_proxy"] = "*"
-    logf = open(os.path.join(BASE, "server.log"), "a", buffering=1)
+    log_path = os.path.join(BASE, "server.log")
+    try:
+        if os.path.exists(log_path) and os.path.getsize(log_path) > 5 * 1024 * 1024:
+            os.replace(log_path, log_path + ".1")  # 超 5MB 轮转一份, 常驻服务日志不无限涨
+    except Exception:
+        pass
+    logf = open(log_path, "a", buffering=1)
     sys.stdout = _Tee(sys.stdout, logf)
     sys.stderr = _Tee(sys.stderr, logf)
     ap = argparse.ArgumentParser()
@@ -1071,6 +1364,18 @@ def main():
 
     player = Player()
     Handler.player = player
+
+    def _on_sigterm(_sig, _frm):
+        # pkill 等默认发 SIGTERM: 必须先杀 ffmpeg 子进程再退出, 否则孤儿转码继续
+        # 1080p 烧 CPU/上行 (坑14). 不抢 Player.lock (可能被换台线程持有几十秒), 直接停 relay
+        print("\n[退出] 收到 SIGTERM, 停止中转…")
+        try:
+            player.relay.stop()
+        except Exception:
+            pass
+        sys.exit(0)
+    signal.signal(signal.SIGTERM, _on_sigterm)
+
     print(f"[OK] 遥控器: http://{MAC_IP}:{PORT}/")
     print(f"[OK] 频道: {len(CHANNELS)} 个 | 双模式: 直连优先, 失败自动转 Mac 中转")
     print("[OK] Ctrl+C 退出")

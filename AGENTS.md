@@ -8,7 +8,7 @@ This file provides guidance to CodeBuddy Code when working with code in this rep
 
 - 仅依赖 Python 标准库（`http.server`、`urllib`、`subprocess` 等），**无需 pip 安装任何包、无虚拟环境**。
 - 兜底模式用系统 PATH 里的 ffmpeg（`FFMPEG` 常量默认 `"ffmpeg"`，可用环境变量 `FFMPEG` 覆盖；当前是 brew 的 `/opt/homebrew/bin/ffmpeg` 9.0.2，自带 CA 证书，https 源可直接拉）。
-- 无测试框架、无 linter、无构建步骤。所有逻辑集中在一个文件里。
+- 无测试框架、无 linter、无构建步骤。所有逻辑集中在一个文件里；`tests/` 下是免依赖的回归脚本（`python3 tests/…` 直接跑）。
 
 ## 常用命令
 
@@ -25,6 +25,13 @@ python3 tv.py
 # 端到端自测（验证某频道是否真在播）
 curl -s "http://127.0.0.1:8899/api/play/0?src=0"
 sleep 8 && curl -s http://127.0.0.1:8899/api/status   # 期望看到 "PLAYING"
+
+# 回归测试（无需真电视，起假 DLNA 服务端；改发现/控制端点逻辑后必跑）
+python3 tests/test_tv_discovery.py                   # 期望 "17 passed, 0 failed"
+TV_IP=192.168.1.10 python3 tests/test_tv_discovery.py  # 追加真电视联调 (18 passed)
+
+# 改完内嵌 JS 必做（坑18：全角标点会炸掉整页脚本，Python 编译器查不出来）
+python3 -c "import re;s=open('tv.py',encoding='utf-8').read();m=re.search(r'PAGE = \"\"\"(.*?)\"\"\"',s,re.S);open('/tmp/p.js','w').write(re.search(r'<script>(.*?)</script>',m.group(1),re.S).group(1))" && node --check /tmp/p.js
 ```
 
 启动后访问 `http://192.168.1.9:8899/`（或 `/remote`）即遥控器页面。环境变量中的代理会在 `main()` 里被显式清空（`tv.py:405`），因为局域网 DLNA/SOAP 控制不能被代理拦截。
@@ -33,7 +40,7 @@ sleep 8 && curl -s http://127.0.0.1:8899/api/status   # 期望看到 "PLAYING"
 
 整个系统是一个进程，内部分三层，入口都在 `tv.py`：
 
-1. **`TV` 类（DLNA 控制层，`tv.py:115`）** — 通过 SSDP 发现设置 IP 上的 DLNA MediaRenderer（通用协议，不限于海信/乐播；乐播 HappyCast 优先，设备名随日志输出）。用 SOAP/HTTP 向电视发 `SetAVTransportURI` + `Play` 控制播放，`GetTransportInfo` 查状态。所有方法都吞异常、返回状态码或简短错误串。
+1. **`TV` 类（DLNA 控制层，`tv.py:115`）** — 发现设置 IP 上的 DLNA MediaRenderer（通用协议，不限于海信/乐播），端点优先级 **HiSmart(38400 固定端口) > SSDP > 乐播(4915x 会漂移)**，每个候选都经 SOAP 验活，见坑24。用 SOAP/HTTP 向电视发 `SetAVTransportURI` + `Play` 控制播放，`GetTransportInfo` 查状态。所有方法都吞异常、返回状态码或简短错误串。
 
 2. **`Relay` 类（Mac 中转层，`tv.py:169`）** — 兜底用时拉起 ffmpeg 把公网源转码成 1080p HLS 切片（`scale=-2:1080`，2 秒一片，列表保 6 片，`omit_endlist` 让电视当作直播无限刷新）。切片落在 `hls_cache/chN/`，由 HTTP Handler 的 `/hls/chN/...` 路由对外提供。支持 `use_proxy` 走 config.json 的 `PROXY` 拉海外源。
 
@@ -73,6 +80,20 @@ sleep 8 && curl -s http://127.0.0.1:8899/api/status   # 期望看到 "PLAYING"
 - **坑 7 UnboundLocalError**：兜底路径在异常场景才触发，其代码要最健壮。`st` 等变量需在 `if` 前先赋值 `None`。
 - **坑 1/2/3 ffmpeg 相关**：裸 mpegts 推流 30 秒电视自停（必须用 HLS + `omit_endlist`）；自编译 ffmpeg 无 CA bundle，https 源报 certificate verify failed（国内源改 http 明文）；输出文件已存在会交互式挂死（`-y` 必加）。
 - **坑 5 电视 SOAP 并发弱**：请求间需 sleep，查询加 3 次重试，否则偶发 "Remote end closed connection"。
+- **坑 12/13 乐播换源两大怪癖**：带 query 的 URL 会被 SetAVTransportURI 以 500 拒绝（`play_url` 自动剥 query 重试）；电视拒绝换源时仍报 PLAYING——换源成功必须 `GetMediaInfo` 核对 CurrentURI 一致（见 `_try_direct`）。
+- **坑 16 自死锁**：`threading.Lock` 不可重入，持锁时调用会抢同一把锁的方法必死锁（`Relay.start` 持锁调 `stop` 曾冻死整个换台队列）。
+- **坑 17 `no_proxy='*'` 杀代理**：进程级 no_proxy 会让 curl/urllib 连显式代理都绕过；拉源 fetch 用清洗过环境的 curl 子进程。
+- **坑 18/19/20**：改内嵌 JS 后必须 `node --check`（全角标点炸整页）；源画质随时间波动（分辨率排序按最近实测）；HTTP 入参名单独显式列出勿与常量名"恰好同形"。完整清单见 wiki/06 坑12~20。
+- **坑 24 死猜端口 = 定时炸弹（2026-10-13 全线故障）**：乐播 DLNA 端口不固定，电视重启后 `49152` → `49153`；叠加宿主 firewalld 拦掉 SSDP 回包，`find_tv()` 返回 `None`，旧代码死猜 `49152` → **所有频道 set=0 play=0、state=UNKNOWN**。现为 A/B 两层根治 + 三条代码保险：
+  - **A. host 放行电视 UDP 回包**（根治 SSDP 失联，已落 permanent）：`firewall-cmd --permanent --zone=public --add-rich-rule='rule family="ipv4" source address="<电视IP>" protocol value="udp" accept'`。**语法坑**：必须写 `protocol value="udp"`，写成 `protocol="udp"` 报 `INVALID_RULE` 且静默无效；`--add-service=ssdp`（只放 1900）**无效**，因为被拦的是回包的目标临时端口。
+  - **B. HiSmart 38400 主力**：电视固件自带的 HiSmart renderer 端口固定，不像乐播漂移。`discover_tv_ctrl()` 优先级 = **HiSmart(38400) > SSDP > 乐播(4915x)**；SSDP 仍用于取友好设备名并作次选。
+  - **代码保险**：`soap_probe()` 验活（端口通/能下 description.xml 都不算，必须收到 `CurrentTransportState` 应答）、`TV._maybe_rediscover()` 连续 3 次传输层失败自动热切换。**改发现逻辑时：任何"先试默认端口"的兜底都必须带验活与重发现。**
+  - **判据**：`set=0`=连不上控制通道，`set=500`=电视拒绝播放——排查先分清这两类。`RelTime` 在两个 renderer 上恒为 `00:00:00`，**不能用来判断是否真在播**；要证真在播，就让电视拉一个你控制的探针 URL 并观察访问日志。
+- **排障顺序（坑 24 教训）**：所有频道同时失败 → 先查控制通道（`state` 是否 UNKNOWN），别查源，源不会整齐地全体阵亡；怀疑"某次提交改坏的"时先 `git diff <commit> -- tv.py | grep -E "^[+-].*(端口|find_tv|SSDP)"` 确认是否真碰到相关代码，再用**同一份代码在两台机器跑**（Mac 正常/服务器失败 = 环境问题，非代码）。
+
+## 页面与部署
+
+页面功能（刷新源/拉源/设置/源筛选）、云端部署形态 A/B/C、通用 DLNA 发现设计、开源脱敏五步清单 → 详见 `wiki/08-页面功能与部署.md`。要点：8899 无鉴权，暴露公网前必须加 token；电视只在启动/保存设置时搜索一次。
 
 ## 文件结构
 
@@ -82,4 +103,4 @@ sleep 8 && curl -s http://127.0.0.1:8899/api/status   # 期望看到 "PLAYING"
 - `remote_sources/parsed.json` — GitHub 源仓库拉取缓存（可删）。
 - `server.log` — 服务运行日志（stdout 同时落盘）。
 - `hls_cache/` — ffmpeg 中转切片运行时目录（`chN/live.m3u8` + `seg*.ts`，`ff_{N}.log` 是 ffmpeg 错误日志，排错先看这里）。
-- `wiki/` — 实战经验存档（`01`~`07`），按"偏好完整度"保存，含电视探测、ADB 不可行、DLNA 协议、选源验证、架构、排错、源刷新全流程。新接手先读 `wiki/README.md` 和 `05-架构设计.md`。
+- `wiki/` — 实战经验存档（`01`~`08`），按"偏好完整度"保存，含电视探测、ADB 不可行、DLNA 协议、选源验证、架构、排错（坑1~20）、源刷新、页面功能与部署全流程。新接手先读 `wiki/README.md` 和 `05-架构设计.md`。
